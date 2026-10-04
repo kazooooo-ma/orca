@@ -165,6 +165,20 @@ export const WorktreeSet = WorktreeSelector.extend({
 })
 
 export const WorktreeRemove = WorktreeSelector.extend({
+  conditional: z
+    .object({
+      runtimeId: z.string().min(1),
+      hostId: z.literal('local'),
+      worktreeId: z.string().min(1),
+      repoId: z.string().min(1),
+      path: z.string().min(1),
+      instanceId: z.string().min(1),
+      lastActivityAt: z.number().finite(),
+      isActive: z.literal(false),
+      hasAttachedPty: z.literal(false)
+    })
+    .strict()
+    .optional(),
   hostId: OptionalExecutionHostId,
   force: OptionalBoolean,
   // Why (#11960): the CLI's --force is an unambiguous force affordance, but the

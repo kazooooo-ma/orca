@@ -2,6 +2,7 @@ import type { Repo } from '../../shared/repo-types'
 import { getRepoExecutionHostId, type ExecutionHostId } from '../../shared/execution-host'
 import { splitWorktreeId } from '../../shared/worktree/id'
 import type { GitPushTarget } from '../../shared/worktree/types'
+import type { ConditionalWorktreeRemoval } from '../../shared/worktree/conditional-removal'
 
 export type RuntimeWorktreeRemovalTarget = {
   id: string
@@ -32,6 +33,7 @@ export function gitStatusErrorMeansNotRepository(error: unknown): boolean {
  * delete, so a transposition would silently delete a checkout the caller meant to protect.
  */
 export type RemoveManagedWorktreeOptions = {
+  conditional?: ConditionalWorktreeRemoval
   force?: boolean
   runHooks?: boolean
   /** Waives proof that every PTY stopped (#11960). Set by explicit Force Delete only. */
@@ -46,7 +48,7 @@ export type RemoveManagedWorktreeOptions = {
 export function getRuntimeWorktreeRemovalOptionsKey(
   options: Pick<
     RemoveManagedWorktreeOptions,
-    'force' | 'runHooks' | 'allowUnverifiedPtyStop' | 'allowFailedArchiveHook'
+    'force' | 'runHooks' | 'allowUnverifiedPtyStop' | 'allowFailedArchiveHook' | 'conditional'
   >
 ): string {
   // Why: a forced retry must not coalesce onto the in-flight attempt that just
@@ -56,7 +58,10 @@ export function getRuntimeWorktreeRemovalOptionsKey(
   // onto the in-flight attempt that is about to refuse on it.
   const archiveKey = options.allowFailedArchiveHook ? 'allow-failed-archive' : 'require-archive'
   const hooksKey = options.runHooks ? 'run-hooks' : 'skip-hooks'
-  return `${options.force ? 'force' : 'normal'}:${hooksKey}:${ptyKey}:${archiveKey}`
+  const conditionalKey = options.conditional
+    ? `:conditional:${JSON.stringify(options.conditional)}`
+    : ''
+  return `${options.force ? 'force' : 'normal'}:${hooksKey}:${ptyKey}:${archiveKey}${conditionalKey}`
 }
 
 // Null executionHostId means host-unaware: path-only callers match any repo, and the first runtime

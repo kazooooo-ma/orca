@@ -9,13 +9,45 @@ export const WATCHER_REMOVAL_FINAL_DRAIN_RESERVE_MS = 10_000
 
 export type WatcherRemovalDeadline = {
   remainingMs(reserveMs?: number): number
+  strict?: boolean
+  track?(promise: Promise<unknown>, requireSuccess?: boolean): void
+  hasPendingDrain?(): boolean
+  settlement?(): Promise<void>
 }
 
 export function createWatcherRemovalDeadline(
-  budgetMs: number = WATCHER_REMOVAL_DRAIN_BUDGET_MS
+  budgetMs: number = WATCHER_REMOVAL_DRAIN_BUDGET_MS,
+  strict = false
 ): WatcherRemovalDeadline {
   const expiresAt = Date.now() + budgetMs
+  const pending = new Set<Promise<unknown>>()
+  let recoveryFailed = false
+  let recoveryFailure: unknown
   return {
+    strict,
+    track: (promise, requireSuccess = false) => {
+      pending.add(promise)
+      void promise.then(
+        () => pending.delete(promise),
+        (error) => {
+          pending.delete(promise)
+          if (requireSuccess) {
+            recoveryFailed = true
+            recoveryFailure = error
+          }
+        }
+      )
+    },
+    hasPendingDrain: () => pending.size > 0 || recoveryFailed,
+    settlement: async () => {
+      // Why: a settling install can register a new native teardown before recovery resumes.
+      while (pending.size > 0) {
+        await Promise.allSettled(pending)
+      }
+      if (recoveryFailed) {
+        throw recoveryFailure
+      }
+    },
     remainingMs: (reserveMs = 0) => Math.max(0, expiresAt - Date.now() - reserveMs)
   }
 }
@@ -23,6 +55,7 @@ export function createWatcherRemovalDeadline(
 export type WatcherRemovalDrainOutcome = 'settled' | 'timeout' | 'skipped'
 
 export type WatcherRemovalDrainOptions = {
+  required?: boolean
   /** Budget this drain must leave behind for the removal's final unsubscribe. */
   reserveMs?: number
 }
@@ -36,7 +69,13 @@ export async function drainBeforeWatcherRemoval(
   options: WatcherRemovalDrainOptions = {}
 ): Promise<WatcherRemovalDrainOutcome> {
   if (!promise) {
+    if (deadline.strict && options.required) {
+      throw new Error(`conditional_worktree_removal_unknown: missing completion for ${label}`)
+    }
     return 'skipped'
+  }
+  if (deadline.strict) {
+    deadline.track?.(promise)
   }
   const waitMs = deadline.remainingMs(options.reserveMs)
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -52,6 +91,9 @@ export async function drainBeforeWatcherRemoval(
       // Why: nobody awaits the abandoned promise anymore, so a late rejection (an aborted native
       // subscribe finally reporting) would be an unhandled rejection — fatal in the main process.
       void settled.catch(() => {})
+      if (deadline.strict) {
+        throw new Error(`conditional_worktree_removal_unknown: timed out waiting for ${label}`)
+      }
       // Why log the budget split: production traces need "slow but finishing" separable from "wedged".
       console.warn(
         `[watcher-removal] Timed out waiting for ${label} after ${waitMs}ms ` +
