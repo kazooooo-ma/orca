@@ -17,6 +17,47 @@ import {
 } from './filesystem-watcher-listener-lifecycle'
 import { subscribeLocalWatcher } from './filesystem-watcher-local-subscription'
 import { cancelLocalBatchFlush } from './filesystem-watcher-batch-control'
+import { isWatcherProcessFailure } from './parcel-watcher-process-failure'
+
+function trackStrictLocalCloseCompletion(
+  rootKey: string,
+  deadline: WatcherRemovalDeadline,
+  source?: Promise<unknown>
+): void {
+  if (!deadline.strict) {
+    return
+  }
+  const completion = (async () => {
+    let results: PromiseSettledResult<unknown>[] = await Promise.allSettled(source ? [source] : [])
+    while (true) {
+      const physicalExits = new Set<Promise<void>>()
+      for (const result of results) {
+        if (
+          result.status === 'rejected' &&
+          isWatcherProcessFailure(result.reason) &&
+          result.reason.physicalExit
+        ) {
+          physicalExits.add(result.reason.physicalExit)
+        }
+      }
+      const retained = watcherLifecycleState.failedLocalUnsubscribes.get(rootKey)
+      if (isWatcherProcessFailure(retained) && retained.physicalExit) {
+        physicalExits.add(retained.physicalExit)
+      }
+      await Promise.all(physicalExits)
+      const unsubscribes = Array.from(
+        watcherLifecycleState.pendingLocalUnsubscribesByRoot.get(rootKey) ?? []
+      )
+      if (unsubscribes.length === 0) {
+        return
+      }
+      // Why: cancellation/error can detach teardown immediately before the install settles.
+      results = await Promise.allSettled(unsubscribes)
+    }
+  })()
+  // Why: failed physical completion is UNKNOWN; restoration must not treat rejection as exit.
+  deadline.track?.(completion, true)
+}
 
 export async function closeLocalWatcherForWorktreePath(
   worktreePath: string,
@@ -57,6 +98,7 @@ export async function closeLocalWatcherForWorktreePath(
   }
   // Why: abort alone is not enough if the native subscribe never settles; bound so delete cannot hang the app.
   const pendingInstall = watcherLifecycleState.pendingLocalInstallPromises.get(rootKey)
+  trackStrictLocalCloseCompletion(rootKey, deadline, pendingInstall)
   const installDrain = await drainBeforeWatcherRemoval(
     pendingInstall,
     deadline,
@@ -77,16 +119,30 @@ export async function closeLocalWatcherForWorktreePath(
   const pendingUnsubscribes = watcherLifecycleState.pendingLocalUnsubscribesByRoot.get(rootKey)
   if (pendingUnsubscribes) {
     const draining = Array.from(pendingUnsubscribes)
+    if (deadline.strict) {
+      for (const unsubscribe of draining) {
+        deadline.track?.(unsubscribe)
+      }
+    }
     const unsubscribeDrain = await drainBeforeWatcherRemoval(
       // Why the per-promise catch: an already-abandoned unsubscribe belongs to a delete that finished
       // without it; re-raising its rejection here would fail a later close on stale news.
-      Promise.all(
-        draining.map((unsubscribe) =>
-          watcherLifecycleState.abandonedLocalUnsubscribes.has(unsubscribe)
-            ? unsubscribe.catch(() => undefined)
-            : unsubscribe
-        )
-      ),
+      deadline.strict
+        ? Promise.allSettled(draining).then((results) => {
+            const failure = results.find(
+              (result): result is PromiseRejectedResult => result.status === 'rejected'
+            )
+            if (failure) {
+              throw failure.reason
+            }
+          })
+        : Promise.all(
+            draining.map((unsubscribe) =>
+              watcherLifecycleState.abandonedLocalUnsubscribes.has(unsubscribe)
+                ? unsubscribe.catch(() => undefined)
+                : unsubscribe
+            )
+          ),
       deadline,
       `local watcher unsubscribe for ${rootKey}`,
       { reserveMs: WATCHER_REMOVAL_FINAL_DRAIN_RESERVE_MS }
@@ -109,6 +165,7 @@ export async function closeLocalWatcherForWorktreePath(
   // here would hang delete forever and hold the removal gate. The promise stays tracked in
   // pendingLocalUnsubscribesByRoot, so a later close still observes its failure.
   const finalUnsubscribe = trackDetachedLocalUnsubscribe(rootKey, root)
+  trackStrictLocalCloseCompletion(rootKey, deadline, finalUnsubscribe)
   const finalDrain = await drainBeforeWatcherRemoval(
     finalUnsubscribe,
     deadline,

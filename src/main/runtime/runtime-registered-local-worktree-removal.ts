@@ -32,6 +32,7 @@ import {
   waitForPendingWorktreeRemoval
 } from '../worktree-background-removal'
 import { runSerializedWorktreeRemovalAcceptance } from '../worktree-removal-acceptance-queue'
+import { refuseConditionalWorktreeRemoval } from './runtime-conditional-worktree-removal'
 
 /** Runs after the previous same-repo removal was accepted; see runSerializedWorktreeRemovalAcceptance. */
 export function removeRuntimeRegisteredLocalWorktree(
@@ -39,11 +40,16 @@ export function removeRuntimeRegisteredLocalWorktree(
 ): Promise<RemoveWorktreeResult & { warning?: string }> {
   return runSerializedWorktreeRemovalAcceptance(
     args.repo.path,
-    async (): Promise<RemoveWorktreeResult & { warning?: string }> =>
+    async (): Promise<RemoveWorktreeResult & { warning?: string }> => {
       // Why: another client's removal of this worktree may have been accepted during the wait.
-      waitForPendingWorktreeRemoval(args.target.id)
-        ? { removing: true }
-        : acceptRuntimeRegisteredLocalWorktreeRemoval(args)
+      if (waitForPendingWorktreeRemoval(args.target.id)) {
+        if (args.assertCondition) {
+          refuseConditionalWorktreeRemoval('background removal already accepted')
+        }
+        return { removing: true }
+      }
+      return acceptRuntimeRegisteredLocalWorktreeRemoval(args)
+    }
   )
 }
 
@@ -61,6 +67,7 @@ async function acceptRuntimeRegisteredLocalWorktreeRemoval(args: {
   allowFailedArchiveHook: boolean
   allowUnverifiedPtyStop: boolean
   deleteBranch: boolean
+  assertCondition?: () => Promise<void>
   acquireWatcherRemoval: (path: string) => Promise<{ finish: (removed: boolean) => Promise<void> }>
   stopPtys: () => Promise<void>
   closeWatchers: (path: string) => Promise<void>
@@ -81,6 +88,19 @@ async function acceptRuntimeRegisteredLocalWorktreeRemoval(args: {
   const { repo, registeredWorktree, localOptions } = args
   const canonicalPath = registeredWorktree.path
   const hooks = getEffectiveHooks(repo)
+  if (
+    args.assertCondition &&
+    (args.hasLocalOptions ||
+      hooks?.scripts.archive ||
+      args.force ||
+      args.runHooks ||
+      args.allowFailedArchiveHook ||
+      args.allowUnverifiedPtyStop)
+  ) {
+    refuseConditionalWorktreeRemoval(
+      'Git host options, archive hooks and removal waivers are unsupported'
+    )
+  }
   let warning: string | undefined
   // Precondition, not an advisory: this runs before the registration refresh, the preflights, the
   // PTY stop and `removeWorktree`, so a throw here leaves every one of them untouched (#19334).
@@ -124,6 +144,9 @@ async function acceptRuntimeRegisteredLocalWorktreeRemoval(args: {
   }
 
   const linkedPaths = getWorktreeSharedLinkPaths(repo)
+  if (args.assertCondition && linkedPaths.length > 0) {
+    refuseConditionalWorktreeRemoval('linked-path teardown is unsupported')
+  }
   const ignoredLinkedPaths = args.force
     ? []
     : await findExistingWorktreeSymlinkPaths(canonicalPath, linkedPaths)
@@ -147,7 +170,7 @@ async function acceptRuntimeRegisteredLocalWorktreeRemoval(args: {
   const gate = await args.acquireWatcherRemoval(canonicalPath)
   let accepted = false
   try {
-    await args.stopPtys()
+    await (args.assertCondition ? args.assertCondition() : args.stopPtys())
     if (linkedPaths.length > 0) {
       await removeWorktreeLinkedPaths(canonicalPath, linkedPaths)
     }
@@ -161,7 +184,7 @@ async function acceptRuntimeRegisteredLocalWorktreeRemoval(args: {
     ...(archiveHookOverride ? { archiveHookOverride } : {}),
     ...(warning ? { warning } : {})
   }
-  if (!removesInBackground(canonicalPath, localOptions)) {
+  if (args.assertCondition || !removesInBackground(canonicalPath, localOptions)) {
     const result = await finishRuntimeLocalWorktreeRemoval(args, refreshed, gate)
     args.publish()
     return { ...result, ...acceptedFields }
@@ -198,6 +221,7 @@ export type RuntimeLocalWorktreeRemovalFinishArgs = Pick<
   | 'closeWatchers'
   | 'preserveBranchHead'
   | 'finishRemoval'
+  | 'assertCondition'
 > & { target: { id: string } }
 
 /** Git's delete and everything after it; the refusals and teardown before it already ran. */
@@ -212,6 +236,9 @@ export async function finishRuntimeLocalWorktreeRemoval(
   let removalResult: RemoveWorktreeResult | undefined
   let completed = false
   try {
+    if (args.assertCondition) {
+      await args.assertCondition()
+    }
     try {
       removalResult = args.preserveBranchHead(
         await removeWorktree(repo.path, canonicalPath, args.force, {
@@ -223,6 +250,9 @@ export async function finishRuntimeLocalWorktreeRemoval(
         refreshed.head
       )
     } catch (error) {
+      if (args.assertCondition) {
+        throw error
+      }
       const recovered = await recoverLocalWindowsWorktreeRemoval({
         error,
         force: args.force,

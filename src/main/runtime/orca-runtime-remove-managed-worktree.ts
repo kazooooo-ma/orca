@@ -28,15 +28,22 @@ import { isRuntimeWorktreePathMissing } from './runtime-worktree-filesystem'
 import { removeStaleLocalWorktreeRegistration } from '../local-worktree-removal-recovery'
 import { cleanupUnusedWorktreePushTargetRemote } from '../ipc/worktree-remote'
 import { removeRuntimeRegisteredRemoteWorktree } from './runtime-registered-remote-worktree-removal'
-import { removeRuntimeRegisteredLocalWorktree } from './runtime-registered-local-worktree-removal'
+import { removeRuntimeRegisteredLocalWorktreeRequest } from './runtime-registered-local-worktree-removal-request'
 import { removeOrphanOrFolderWorktree } from './orca-runtime-remove-orphan-or-folder-worktree'
 import { deleteRemoteWorktreeHistory } from '../remote-worktree-history-cleanup'
+import {
+  assertConditionalRemovalTarget,
+  assertConditionalRemovalRepo,
+  refuseConditionalRemovalFallback,
+  snapshotConditionalWorktreeRemoval
+} from './runtime-conditional-worktree-removal'
 
 export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateManagedRemoteWorktree {
   async removeManagedWorktree(
     worktreeSelector: string,
     options: RemoveManagedWorktreeOptions = {}
   ): Promise<RemoveWorktreeResult & { warning?: string }> {
+    const conditional = snapshotConditionalWorktreeRemoval(options)
     const {
       force = false,
       runHooks = false,
@@ -50,9 +57,11 @@ export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateM
     const store = this.store
     const cleanupHostId = parseExecutionHostId(hostId)?.id
     const removalTarget = await this.resolveWorktreeRemovalTarget(worktreeSelector, cleanupHostId)
+    assertConditionalRemovalTarget(conditional, removalTarget)
     // Why: a retry or a second client asking while Git still deletes joins that removal.
     const pending = this.joinPendingWorktreeRemoval(removalTarget.id, options)
     if (pending) {
+      refuseConditionalRemovalFallback(conditional, 'pending')
       return options.waitForBackgroundRemoval ? await pending : { removing: true }
     }
     const emitRemoved = (): void =>
@@ -69,7 +78,8 @@ export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateM
       force,
       runHooks,
       allowUnverifiedPtyStop,
-      allowFailedArchiveHook
+      allowFailedArchiveHook,
+      conditional
     })
     const inFlightRemoval = this.removeManagedWorktreeInFlight.get(
       cleanupScopeKey,
@@ -95,16 +105,19 @@ export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateM
         }
         const repo = repoOwner.kind === 'resolved' ? repoOwner.repo : undefined
         const removalHostId = repo ? (cleanupHostId ?? getRepoExecutionHostId(repo)) : cleanupHostId
+        assertConditionalRemovalRepo(conditional, repo)
         const purgeRemovedWorktree = (): void =>
           this.purgeRemovedWorktree(store, removalTarget.id, removalTarget.repoId, removalHostId)
-        const orphanOrFolderResult = await removeOrphanOrFolderWorktree({
-          runtime: this,
-          store,
-          removalTarget,
-          cleanupHostId,
-          removalHostId,
-          repo
-        })
+        const orphanOrFolderResult = conditional
+          ? null
+          : await removeOrphanOrFolderWorktree({
+              runtime: this,
+              store,
+              removalTarget,
+              cleanupHostId,
+              removalHostId,
+              repo
+            })
         if (orphanOrFolderResult) {
           return orphanOrFolderResult
         }
@@ -131,10 +144,14 @@ export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateM
           registeredWorktrees,
           removalHome
         )
-        if (this.retryFailedLocalRemoval(route, removalTarget, registeredWorktrees, options)) {
+        if (
+          !conditional &&
+          this.retryFailedLocalRemoval(route, removalTarget, registeredWorktrees, options)
+        ) {
           return { removing: true }
         }
         if (!registeredWorktree) {
+          refuseConditionalRemovalFallback(conditional, 'unregistered')
           return removeRuntimeUnregisteredWorktree({
             repo,
             target: removalTarget,
@@ -185,6 +202,7 @@ export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateM
                 localWorktreeGitOptions
               ))))
         ) {
+          refuseConditionalRemovalFallback(conditional, 'stale')
           const removalResult = await removeStaleLocalWorktreeRegistration({
             canonicalWorktreePath,
             repoPath: repo.path,
@@ -211,6 +229,7 @@ export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateM
           return removalResult ?? {}
         }
         if (route.kind === 'ssh') {
+          refuseConditionalRemovalFallback(conditional, 'remote')
           return removeRuntimeRegisteredRemoteWorktree({
             runHooks,
             allowFailedArchiveHook,
@@ -250,43 +269,23 @@ export class OrcaRuntimeWithRemoveManagedWorktree extends OrcaRuntimeWithCreateM
             }
           })
         }
-        return removeRuntimeRegisteredLocalWorktree({
+        return removeRuntimeRegisteredLocalWorktreeRequest({
+          runtime: this,
+          conditional,
           repo,
           target: removalTarget,
           registeredWorktree,
           removedPushTarget,
           store,
           localOptions: localWorktreeGitOptions,
-          hasLocalOptions: Object.keys(localWorktreeGitOptions).length > 0,
           force,
           runHooks,
           allowFailedArchiveHook,
           allowUnverifiedPtyStop,
           deleteBranch,
-          acquireWatcherRemoval: this.acquireFileWatcherRemoval,
-          stopPtys: () =>
-            this.stopPtysForDestructiveWorktreeRemoval(removalTarget.id, {
-              allowUnverifiedStop: allowUnverifiedPtyStop
-            }),
-          closeWatchers: (path) => this.closeFileWatchersForRemoval(path),
-          preserveBranchHead: (result, fallbackHead) =>
-            this.preservedBranchCleanup.preserveHead(result, fallbackHead),
-          finishRemoval: (result, rememberBranch, fallbackHead) => {
-            if (rememberBranch) {
-              this.preservedBranchCleanup.remember(
-                removalTarget.id,
-                cleanupHostId,
-                result,
-                fallbackHead,
-                removedPushTarget
-              )
-            } else {
-              this.preservedBranchCleanup.delete(removalTarget.id, cleanupHostId)
-            }
-            purgeRemovedWorktree()
-          },
-          onRemoved: emitRemoved,
-          publish: () => this.publishWorktreeRemovalChange(repo.id)
+          cleanupHostId,
+          purgeRemovedWorktree,
+          onRemoved: emitRemoved
         })
       })
     })()

@@ -248,6 +248,7 @@ export const WORKTREE_METHODS = [
       const explicitWorktreeId = getExplicitWorktreeIdSelector(params.worktree)
       const repoId = explicitWorktreeId ? splitWorktreeId(explicitWorktreeId)?.repoId : undefined
       const result = await runtime.removeManagedWorktree(params.worktree, {
+        ...(params.conditional ? { conditional: params.conditional } : {}),
         force: params.force === true,
         runHooks: params.runHooks === true,
         allowUnverifiedPtyStop: params.allowUnverifiedPtyStop === true,
