@@ -6,7 +6,8 @@ import type {
   RuntimeTerminalRename,
   RuntimeTerminalShow,
   RuntimeTerminalSplit,
-  RuntimeTerminalWait
+  RuntimeTerminalWait,
+  RuntimeWorktreeRecord
 } from '../../shared/runtime-types'
 import type { CommandHandler } from '../dispatch'
 import { shouldUseRendererBackedInteractiveTerminal } from '../codex-command-classification'
@@ -31,6 +32,7 @@ import {
   type WithAnnotatedHostScope
 } from '../omitted-host-scope-selectors'
 import { RuntimeClientError } from '../runtime-client'
+import { parseTerminalCreateEnvJson } from '../terminal-create-env'
 import {
   isSupportedWindowsShellOverride,
   listSupportedWindowsShellOverrides
@@ -148,6 +150,13 @@ export const TERMINAL_HANDLERS: Record<string, CommandHandler> = {
     printResult(result, json, formatTerminalRename)
   },
   'terminal create': async ({ flags, client, cwd, json }) => {
+    const env = parseTerminalCreateEnvJson(getOptionalStringFlag(flags, 'env-json'))
+    if (env !== undefined && client.isRemote) {
+      throw new RuntimeClientError(
+        'invalid_argument',
+        '--env-json currently requires a local execution host; no terminal was created'
+      )
+    }
     if (client.isRemote && !flags.has('worktree')) {
       throw new RuntimeClientError(
         'invalid_argument',
@@ -188,9 +197,28 @@ export const TERMINAL_HANDLERS: Record<string, CommandHandler> = {
         )
       }
     }
+    let worktree = await getBrowserWorktreeSelector(flags, cwd, client)
+    if (env !== undefined) {
+      const target = await client.call<{ worktree: RuntimeWorktreeRecord }>('worktree.show', {
+        worktree
+      })
+      if (
+        target.result.worktree?.hostId !== 'local' ||
+        target.result.worktree.runtimeOwnerEnvironmentId !== undefined ||
+        typeof target.result.worktree.id !== 'string' ||
+        target.result.worktree.id.trim().length === 0
+      ) {
+        throw new RuntimeClientError(
+          'incompatible_runtime',
+          '--env-json requires a verified local worktree execution host; no terminal was created'
+        )
+      }
+      worktree = `id:${target.result.worktree.id}`
+    }
     const result = await client.call<{ terminal: RuntimeTerminalCreate }>('terminal.create', {
-      worktree: await getBrowserWorktreeSelector(flags, cwd, client),
+      worktree,
       command,
+      ...(env !== undefined ? { env } : {}),
       ...(shell !== undefined ? { shell } : {}),
       title: getOptionalStringFlag(flags, 'title'),
       // Why: interactive local agent TUIs need the renderer-backed terminal
