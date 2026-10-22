@@ -86,14 +86,14 @@ export function getPiAgentStatusHandlerSourceLines(kind: PiAgentKind): string[] 
       ? []
       : [
           `  pi.on('model_select', (event${ctxParam}) => {`,
-          ...captureSessionMetadata,
           '    if (!isOmpRuntime()) return',
+          '    if (!claimSessionStatus(ctx)) return',
+          ...captureSessionMetadata,
           '    updateModelMetadata(event)',
           "    post('model_select')",
           '  })',
           ''
         ]
-
   return [
     ...getAgentStatusInputRedactionSourceLines(),
     '// Why: pi assistant messages carry content as an array of parts',

@@ -7,6 +7,7 @@ import { vi } from 'vitest'
 import { getPiAgentStatusExtensionSource } from './agent-status-extension-source'
 
 export type HookContext = {
+  agent?: { kind?: string }
   hasUI?: boolean
   ui?: { setEditorText?: (text: string) => void; notify?: (message: string, level: string) => void }
   isIdle?: () => boolean
@@ -20,7 +21,7 @@ export type HookContext = {
 }
 
 type PiEventBus = {
-  on: (name: string, listener: (event: unknown) => void) => unknown
+  on: (name: string, listener: (event: unknown, context?: HookContext) => void) => unknown
 }
 
 export type HookHandler = (event?: unknown, context?: HookContext) => Promise<void> | void
@@ -50,7 +51,7 @@ export type AgentStatusExtensionHarness = {
   handlers: Record<string, HookHandler>
   processEnv: Record<string, string | undefined>
   callHook: (name: string, event?: unknown, context?: HookContext) => Promise<void>
-  emitPiEvent: (name: string, event: unknown) => void
+  emitPiEvent: (name: string, event: unknown, context?: HookContext) => void
   piEventListenerCount: (name: string) => number
   // Re-run the factory on the same event bus and module state.
   reload: () => void
@@ -61,7 +62,7 @@ export type AgentStatusExtensionHarness = {
   reloadPi: () => Promise<void>
   // An OMP in-process task child: the same module's factory, run again on the child's own bus.
   // Returns an emitter for events on that child's bus.
-  registerTaskChild: () => (name: string, event: unknown) => void
+  registerTaskChild: () => (name: string, event: unknown, context?: HookContext) => void
 }
 
 const BASE_ENV = {
@@ -229,7 +230,7 @@ export function createAgentStatusExtensionHarness(args: {
   // Why: Pi calls every handler an extension registers for an event, in registration order.
   let handlerLists: Record<string, HookHandler[]> = {}
   let piEvents = new EventEmitter()
-  let busSubscriptions: [string, (event: unknown) => void][] = []
+  let busSubscriptions: [string, (event: unknown, context?: HookContext) => void][] = []
   const commands: AgentStatusExtensionHarness['commands'] = {}
   const setModelMock = vi.fn(async (_model: unknown) => true)
   const registerInto = (
@@ -266,7 +267,7 @@ export function createAgentStatusExtensionHarness(args: {
     }
     const bus = piEvents
     registerInto(handlers, {
-      on(name: string, listener: (event: unknown) => void) {
+      on(name: string, listener: (event: unknown, context?: HookContext) => void) {
         bus.on(name, listener)
         busSubscriptions.push([name, listener])
       }
@@ -290,8 +291,8 @@ export function createAgentStatusExtensionHarness(args: {
     handlers,
     processEnv: processMock.env,
     callHook,
-    emitPiEvent: (name, event) => {
-      piEvents.emit(name, event)
+    emitPiEvent: (name, event, hookContext) => {
+      piEvents.emit(name, event, hookContext)
     },
     piEventListenerCount: (name) => piEvents.listenerCount(name),
     reload: () => {
@@ -310,8 +311,8 @@ export function createAgentStatusExtensionHarness(args: {
       const childBus = new EventEmitter()
       registerInto({}, childBus)
       handlerLists = leadHandlerLists
-      return (name, event) => {
-        childBus.emit(name, event)
+      return (name, event, hookContext) => {
+        childBus.emit(name, event, hookContext)
       }
     },
     reloadPi: async () => {

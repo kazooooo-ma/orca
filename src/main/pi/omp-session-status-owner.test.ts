@@ -143,6 +143,140 @@ describe('OMP session status ownership', () => {
     await settle()
     expect(harness.fetchMock).not.toHaveBeenCalled()
   })
+
+  it('reports start, tool use, and completion for a forked main session', async () => {
+    const harness = createAgentStatusExtensionHarness({ kind: 'omp' })
+    let sessionId = 'root-session'
+    let sessionFile = '/sessions/root.jsonl'
+    let parentSession: string | undefined
+    const sessionManager = {
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+      getHeader: () => ({ parentSession })
+    }
+    const previousMain = {
+      agent: { kind: 'main' },
+      sessionManager
+    }
+    await harness.callHook('before_agent_start', { prompt: 'root' }, previousMain)
+    await settle()
+    harness.fetchMock.mockClear()
+    sessionId = 'fork-main'
+    sessionFile = '/sessions/fork-main.jsonl'
+    parentSession = 'root-session'
+    const forkedMain = {
+      agent: { kind: 'main' },
+      hasUI: false,
+      model: { provider: 'anthropic', id: 'claude-sonnet' },
+      sessionManager
+    }
+
+    await harness.callHook('agent_start', {}, forkedMain)
+    await settle()
+    await harness.callHook(
+      'tool_call',
+      { toolName: 'bash', input: { command: 'echo ok' } },
+      forkedMain
+    )
+    await settle()
+    await harness.callHook('agent_end', {}, forkedMain)
+    await settle()
+
+    const payloads = harness.fetchMock.mock.calls.map((call) => JSON.parse(call[1].body).payload)
+    expect(
+      payloads.map(({ hook_event_name, session_id, session_file, model }) => ({
+        hook_event_name,
+        session_id,
+        session_file,
+        model
+      }))
+    ).toEqual([
+      {
+        hook_event_name: 'agent_start',
+        session_id: 'fork-main',
+        session_file: '/sessions/fork-main.jsonl',
+        model: 'anthropic/claude-sonnet'
+      },
+      {
+        hook_event_name: 'tool_call',
+        session_id: 'fork-main',
+        session_file: '/sessions/fork-main.jsonl',
+        model: 'anthropic/claude-sonnet'
+      },
+      {
+        hook_event_name: 'agent_end',
+        session_id: 'fork-main',
+        session_file: '/sessions/fork-main.jsonl',
+        model: 'anthropic/claude-sonnet'
+      }
+    ])
+  })
+
+  it('ignores child model and session events without corrupting the forked main pane', async () => {
+    const harness = createAgentStatusExtensionHarness({ kind: 'omp' })
+    const forkedMain = {
+      agent: { kind: 'main' },
+      hasUI: false,
+      model: { provider: 'anthropic', id: 'claude-sonnet' },
+      sessionManager: {
+        getSessionId: () => 'fork-main',
+        getSessionFile: () => '/sessions/fork-main.jsonl',
+        getHeader: () => ({ parentSession: 'root-session' })
+      }
+    }
+    await harness.callHook('agent_start', {}, forkedMain)
+    await settle()
+    harness.fetchMock.mockClear()
+
+    const child = {
+      agent: { kind: 'sub' },
+      model: { provider: 'openai', id: 'child-model' },
+      sessionManager: {
+        getSessionId: () => 'child',
+        getSessionFile: () => '/sessions/child.jsonl'
+      }
+    }
+    harness.emitPiEvent('model_select', { model: child.model }, child)
+    harness.emitPiEvent('session_switch', { reason: 'fork' }, child)
+    harness.emitPiEvent('session_branch', { reason: 'new' }, child)
+    harness.emitPiEvent('session_shutdown', { reason: 'new' }, child)
+    await settle()
+    expect(harness.fetchMock).not.toHaveBeenCalled()
+
+    const forkedMainWithoutModel = { ...forkedMain, model: undefined }
+    await harness.callHook(
+      'tool_call',
+      { toolName: 'bash', input: { command: 'echo still-root' } },
+      forkedMainWithoutModel
+    )
+    await settle()
+    await harness.callHook('agent_end', {}, forkedMainWithoutModel)
+    await settle()
+
+    const payloads = harness.fetchMock.mock.calls.map((call) => JSON.parse(call[1].body).payload)
+    expect(
+      payloads.map(({ hook_event_name, session_id, session_file, model }) => ({
+        hook_event_name,
+        session_id,
+        session_file,
+        model
+      }))
+    ).toEqual([
+      {
+        hook_event_name: 'tool_call',
+        session_id: 'fork-main',
+        session_file: '/sessions/fork-main.jsonl',
+        model: 'anthropic/claude-sonnet'
+      },
+      {
+        hook_event_name: 'agent_end',
+        session_id: 'fork-main',
+        session_file: '/sessions/fork-main.jsonl',
+        model: 'anthropic/claude-sonnet'
+      }
+    ])
+  })
+
   it('keeps reporting for legacy callbacks without a session manager', async () => {
     const harness = createAgentStatusExtensionHarness({ kind: 'omp' })
     await harness.callHook('agent_start')
@@ -160,20 +294,28 @@ describe('OMP runtime session provenance', () => {
     'rejects an earlier child callback before it can claim the %s pane',
     async (kind) => {
       const harness = createAgentStatusExtensionHarness({ kind, argv: ['bun', '/opt/omp/bin/omp'] })
+      let sessionId = 'child'
+      let sessionFile = '/child.jsonl'
+      const sessionManager = {
+        getSessionId: () => sessionId,
+        getSessionFile: () => sessionFile
+      }
       const child = {
-        agentKind: 'sub',
+        agent: { kind: 'sub' },
         hasUI: false,
-        sessionManager: { getSessionId: () => 'child', getSessionFile: () => '/child.jsonl' }
+        sessionManager
       }
       await harness.callHook('session_start', {}, child)
       await harness.callHook('agent_start', {}, child)
       await settle()
       expect(harness.fetchMock).not.toHaveBeenCalled()
       harness.reload()
+      sessionId = 'root'
+      sessionFile = '/root.jsonl'
       const root = {
-        agentKind: 'main',
+        agent: { kind: 'main' },
         hasUI: false,
-        sessionManager: { getSessionId: () => 'root', getSessionFile: () => '/root.jsonl' }
+        sessionManager
       }
       await harness.callHook('session_start', {}, root)
       await settle()
@@ -185,20 +327,26 @@ describe('OMP runtime session provenance', () => {
     }
   )
 
-  it('allows a former child transcript resumed as the runtime main session', async () => {
+  it('allows a fork transcript resumed as the runtime main session', async () => {
     const harness = createAgentStatusExtensionHarness({ kind: 'omp' })
-    const root = {
+    const resumedMain = {
+      agent: { kind: 'main' },
       hasUI: false,
+      model: { provider: 'anthropic', id: 'claude-sonnet' },
       sessionManager: {
         getSessionId: () => 'resumed-child',
-        getSessionFile: () => '/sessions/parent/subagent/child.jsonl'
+        getSessionFile: () => '/sessions/parent/subagent/child.jsonl',
+        getHeader: () => ({ parentSession: 'parent-session' })
       }
     }
-    await harness.callHook('session_start', {}, root)
-    await harness.callHook('agent_start', {}, root)
+    harness.emitPiEvent('session_switch', { reason: 'resume' }, resumedMain)
+    await harness.callHook('agent_start', {}, resumedMain)
     await settle()
-    expect(JSON.parse(harness.fetchMock.mock.calls[0][1].body).payload.session_id).toBe(
-      'resumed-child'
-    )
+    expect(JSON.parse(harness.fetchMock.mock.calls[0][1].body).payload).toMatchObject({
+      hook_event_name: 'agent_start',
+      session_id: 'resumed-child',
+      session_file: '/sessions/parent/subagent/child.jsonl',
+      model: 'anthropic/claude-sonnet'
+    })
   })
 })

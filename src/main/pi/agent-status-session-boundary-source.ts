@@ -40,7 +40,12 @@ export function getAgentStatusSessionBoundaryHandlerSourceLines(kind: PiAgentKin
   return [
     ...(kind !== 'pi'
       ? [
-          "  pi.on('session_shutdown', () => { resetSubagentRoster(); resetPostQueue(); clearPendingAgentEndCheck() })"
+          "  pi.on('session_shutdown', (event, ctx) => {",
+          '    if (isOmpRuntime() && !ownsSessionStatus(ctx)) return',
+          '    resetSubagentRoster()',
+          '    resetPostQueue()',
+          '    clearPendingAgentEndCheck()',
+          '  })'
         ]
       : []),
     ...(kind !== 'prime-agent'
@@ -50,6 +55,7 @@ export function getAgentStatusSessionBoundaryHandlerSourceLines(kind: PiAgentKin
           // and reporting here.
           '  const onOmpSessionChange = (event, ctx) => {',
           '    if (!isOmpRuntime()) return',
+          '    if (!claimSessionStatus(ctx)) return',
           "    if (event?.reason === 'fork' || event?.reason === 'resume') {",
           // Why: a resume cuts a running turn off without an agent_end.
           '      if (isTurnInFlight()) {',
